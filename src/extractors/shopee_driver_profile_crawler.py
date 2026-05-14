@@ -116,12 +116,9 @@ async def extract_shopee_driver_profile() -> Path:
                 ).count()
                 logger.info(f"📊 Baseline: {baseline_count} tarefas com botão Baixar antes do export")
                 await page.screenshot(path=str(output_path / "painel_baseline.png"))
-                # Fecha painel para liberar a tela
-                await page.keyboard.press("Escape")
+                # Fecha o painel clicando no MESMO ícone (toggle)
+                await icone_baseline.click()
                 await page.wait_for_timeout(2_000)
-                # Fallback: clica fora do painel
-                await page.locator("body").click(position={"x": 100, "y": 400})
-                await page.wait_for_timeout(1_000)
             except Exception as e:
                 logger.warning(f"Não conseguiu capturar baseline: {e} — assumindo 0")
                 baseline_count = 0
