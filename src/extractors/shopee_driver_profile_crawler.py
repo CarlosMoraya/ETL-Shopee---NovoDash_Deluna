@@ -13,6 +13,7 @@ Fluxo:
 """
 import asyncio
 import os
+import zipfile
 from pathlib import Path
 from datetime import datetime
 
@@ -188,7 +189,18 @@ async def extract_shopee_driver_profile() -> Path:
     # 8. PROCESSAR COM PANDAS
     logger.info("Processando arquivo...")
     sufixo = Path(caminho_arquivo).suffix.lower()
-    if sufixo == ".csv":
+
+    if sufixo == ".zip":
+        with zipfile.ZipFile(caminho_arquivo, 'r') as zip_ref:
+            arquivos = zip_ref.namelist()
+            excel_files = [f for f in arquivos if f.endswith(('.xlsx', '.xls'))]
+            if not excel_files:
+                raise Exception(f"Nenhum arquivo Excel encontrado no ZIP. Arquivos: {arquivos}")
+            arquivo_excel = excel_files[0]
+            logger.info(f"Extraindo {arquivo_excel} do ZIP...")
+            with zip_ref.open(arquivo_excel) as f:
+                df = pd.read_excel(f)
+    elif sufixo == ".csv":
         df = pd.read_csv(caminho_arquivo)
     else:
         df = pd.read_excel(caminho_arquivo)
