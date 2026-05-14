@@ -104,7 +104,29 @@ async def extract_shopee_driver_profile() -> Path:
             except Exception as e:
                 logger.warning(f"Botão 'Procurar' não encontrado: {e}")
 
-            # 4. ABRIR DROPDOWN DE EXPORTAR e contar "Baixar" visíveis ANTES de disparar
+            # 4. CAPTURAR BASELINE — abrir painel, contar Baixar buttons existentes, fechar
+            logger.info("Capturando baseline de tarefas no painel ANTES de exportar...")
+            try:
+                icone_baseline = page.locator('div[data-v-13320df0].icon').first
+                await icone_baseline.wait_for(timeout=10_000)
+                await icone_baseline.click()
+                await page.wait_for_timeout(3_000)
+                baseline_count = await page.locator(
+                    'button:has-text("Baixar"), button:has-text("Download")'
+                ).count()
+                logger.info(f"📊 Baseline: {baseline_count} tarefas com botão Baixar antes do export")
+                await page.screenshot(path=str(output_path / "painel_baseline.png"))
+                # Fecha painel para liberar a tela
+                await page.keyboard.press("Escape")
+                await page.wait_for_timeout(2_000)
+                # Fallback: clica fora do painel
+                await page.locator("body").click(position={"x": 100, "y": 400})
+                await page.wait_for_timeout(1_000)
+            except Exception as e:
+                logger.warning(f"Não conseguiu capturar baseline: {e} — assumindo 0")
+                baseline_count = 0
+
+            # 5. ABRIR DROPDOWN DE EXPORTAR
             logger.info("Clicando em 'Exportar' para abrir dropdown...")
             try:
                 botao_exportar = page.locator('button:has-text("Exportar")').first
@@ -117,12 +139,7 @@ async def extract_shopee_driver_profile() -> Path:
 
             await page.wait_for_timeout(2_000)
 
-            # Contar "Baixar" visíveis no popup que pode abrir com o dropdown
-            botoes_baixar = page.locator('button:has-text("Baixar"), button:has-text("Download")')
-            count_antes = await botoes_baixar.count()
-            logger.info(f"Botões 'Baixar' visíveis antes de exportar: {count_antes}")
-
-            # 5. CLICAR NA OPÇÃO "EXPORTAR" DO DROPDOWN
+            # 6. CLICAR NA OPÇÃO "EXPORTAR" DO DROPDOWN
             logger.info("Clicando na opção 'Exportar' do dropdown...")
             opcao = page.locator('text=Exportar').nth(1)
             await opcao.wait_for(timeout=10_000)
@@ -152,39 +169,27 @@ async def extract_shopee_driver_profile() -> Path:
                 await page.screenshot(path=str(output_path / "erro_painel.png"))
                 raise Exception("Não foi possível abrir o painel 'Última tarefa'.")
 
-            # 7. LOCALIZAR TAREFA DO DRIVER PROFILE (filtrar por nome contendo "br_driver" ou "driver")
-            # O painel lista TODAS as tarefas históricas — precisamos achar a do driver profile,
-            # não a do PNR ou outras. O arquivo gerado tem nome com "br_driver".
-            logger.info("Procurando tarefa do driver profile no painel...")
-            palavras_chave = ["spx_driver", "br_driver", "driver_profile", "driver-profile"]
+            # 7. AGUARDAR NOVA TAREFA — count de Baixar deve aumentar vs baseline
+            logger.info(f"Aguardando NOVA tarefa aparecer no painel (baseline: {baseline_count})...")
             botao_baixar = None
             encontrado = False
 
-            for tentativa in range(8):
-                # Para cada palavra-chave, procura uma linha do painel que a contenha
-                # e tenha um botão Baixar visível
-                for palavra in palavras_chave:
-                    candidato = page.locator(
-                        f'*:has-text("{palavra}")'
-                    ).locator(
-                        'button:has-text("Baixar"), button:has-text("Download")'
-                    ).first
-                    try:
-                        await candidato.wait_for(timeout=5_000, state="visible")
-                        botao_baixar = candidato
-                        encontrado = True
-                        logger.info(f"✅ Tarefa encontrada (palavra-chave: '{palavra}', tentativa {tentativa + 1})!")
-                        break
-                    except Exception:
-                        continue
+            for tentativa in range(10):
+                botoes_baixar = page.locator('button:has-text("Baixar"), button:has-text("Download")')
+                current_count = await botoes_baixar.count()
+                logger.info(f"Tentativa {tentativa + 1}: {current_count} botões Baixar (baseline: {baseline_count})")
 
-                if encontrado:
+                if current_count > baseline_count:
+                    logger.info(f"✅ Nova tarefa detectada! ({current_count} > {baseline_count})")
+                    botao_baixar = botoes_baixar.first  # topmost = mais recente
+                    encontrado = True
                     break
 
                 elapsed_extra = (tentativa + 1) * 30
-                logger.info(f"Tarefa do driver profile não pronta — aguardando 30s ({elapsed_extra}s extra)...")
-                await page.screenshot(path=str(output_path / f"aguardando_driver_{elapsed_extra}s.png"))
-                # Reabre o painel para atualizar status
+                logger.info(f"Nenhuma nova tarefa ainda — aguardando 30s ({elapsed_extra}s extra)...")
+                await page.screenshot(path=str(output_path / f"aguardando_nova_tarefa_{elapsed_extra}s.png"))
+
+                # Fecha e reabre o painel para forçar atualização do status
                 await page.keyboard.press("Escape")
                 await page.wait_for_timeout(2_000)
                 try:
@@ -196,9 +201,10 @@ async def extract_shopee_driver_profile() -> Path:
                     logger.warning(f"Erro ao reabrir painel: {e}")
 
             if not encontrado:
-                await page.screenshot(path=str(output_path / "erro_sem_baixar.png"))
+                await page.screenshot(path=str(output_path / "erro_sem_nova_tarefa.png"))
                 raise Exception(
-                    "Timeout: tarefa do driver profile (spx_driver) não apareceu após 240s adicionais."
+                    f"Timeout: nenhuma nova tarefa de export apareceu após 300s "
+                    f"(baseline={baseline_count}). Export pode não ter sido disparado."
                 )
 
             # 8. DOWNLOAD — clica no botão "Baixar" do driver profile
@@ -211,9 +217,9 @@ async def extract_shopee_driver_profile() -> Path:
             nome_baixado = download.suggested_filename.lower()
             logger.info(f"Nome do arquivo baixado: {download.suggested_filename}")
 
-            if not any(p in nome_baixado for p in ["spx_driver", "br_driver", "driver_profile", "driver-profile"]):
+            if "driver" not in nome_baixado:
                 raise Exception(
-                    f"Arquivo baixado não é do driver profile! Nome: {download.suggested_filename}"
+                    f"Arquivo baixado não é do driver profile (não contém 'driver')! Nome: {download.suggested_filename}"
                 )
 
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
