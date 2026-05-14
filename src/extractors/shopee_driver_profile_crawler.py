@@ -152,32 +152,70 @@ async def extract_shopee_driver_profile() -> Path:
                 await page.screenshot(path=str(output_path / "erro_painel.png"))
                 raise Exception("Não foi possível abrir o painel 'Última tarefa'.")
 
-            # 7. AGUARDAR BOTÃO "BAIXAR" NO PAINEL (com retentativas de 30s)
-            logger.info("Aguardando botão 'Baixar' no painel...")
-            caminho_arquivo = None
-            botao_baixar = page.locator('button:has-text("Baixar"), button:has-text("Download")').first
+            # 7. LOCALIZAR TAREFA DO DRIVER PROFILE (filtrar por nome contendo "br_driver" ou "driver")
+            # O painel lista TODAS as tarefas históricas — precisamos achar a do driver profile,
+            # não a do PNR ou outras. O arquivo gerado tem nome com "br_driver".
+            logger.info("Procurando tarefa do driver profile no painel...")
+            palavras_chave = ["br_driver", "driver_profile", "driver-profile"]
+            botao_baixar = None
             encontrado = False
-            for tentativa_baixar in range(4):
-                try:
-                    await botao_baixar.wait_for(timeout=30_000)
-                    logger.info(f"✅ Botão 'Baixar' encontrado após {tentativa_baixar * 30}s adicionais!")
-                    encontrado = True
+
+            for tentativa in range(8):
+                # Para cada palavra-chave, procura uma linha do painel que a contenha
+                # e tenha um botão Baixar visível
+                for palavra in palavras_chave:
+                    candidato = page.locator(
+                        f'*:has-text("{palavra}")'
+                    ).locator(
+                        'button:has-text("Baixar"), button:has-text("Download")'
+                    ).first
+                    try:
+                        await candidato.wait_for(timeout=5_000, state="visible")
+                        botao_baixar = candidato
+                        encontrado = True
+                        logger.info(f"✅ Tarefa encontrada (palavra-chave: '{palavra}', tentativa {tentativa + 1})!")
+                        break
+                    except Exception:
+                        continue
+
+                if encontrado:
                     break
-                except Exception:
-                    elapsed_extra = (tentativa_baixar + 1) * 30
-                    logger.info(f"Botão 'Baixar' não visível ainda — aguardando mais 30s ({elapsed_extra}s extra)...")
-                    await page.screenshot(path=str(output_path / f"aguardando_baixar_{elapsed_extra}s.png"))
+
+                elapsed_extra = (tentativa + 1) * 30
+                logger.info(f"Tarefa do driver profile não pronta — aguardando 30s ({elapsed_extra}s extra)...")
+                await page.screenshot(path=str(output_path / f"aguardando_driver_{elapsed_extra}s.png"))
+                # Reabre o painel para atualizar status
+                await page.keyboard.press("Escape")
+                await page.wait_for_timeout(2_000)
+                try:
+                    icone = page.locator('div[data-v-13320df0].icon').first
+                    await icone.wait_for(timeout=5_000)
+                    await icone.click()
+                    await page.wait_for_timeout(3_000)
+                except Exception as e:
+                    logger.warning(f"Erro ao reabrir painel: {e}")
 
             if not encontrado:
                 await page.screenshot(path=str(output_path / "erro_sem_baixar.png"))
-                raise Exception("Timeout: botão 'Baixar' não apareceu no painel após 120s adicionais.")
+                raise Exception(
+                    "Timeout: tarefa do driver profile (br_driver) não apareceu após 240s adicionais."
+                )
 
-            # 8. DOWNLOAD — clica no PRIMEIRO botão "Baixar" (mais recente, topo do painel)
-            logger.info("Clicando em 'Baixar' no export mais recente...")
+            # 8. DOWNLOAD — clica no botão "Baixar" do driver profile
+            caminho_arquivo = None
+            logger.info("Clicando em 'Baixar' da tarefa do driver profile...")
             async with page.expect_download(timeout=120_000) as download_info:
                 await botao_baixar.click()
 
             download = await download_info.value
+            nome_baixado = download.suggested_filename.lower()
+            logger.info(f"Nome do arquivo baixado: {download.suggested_filename}")
+
+            if not any(p in nome_baixado for p in ["br_driver", "driver_profile", "driver-profile"]):
+                raise Exception(
+                    f"Arquivo baixado não é do driver profile! Nome: {download.suggested_filename}"
+                )
+
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             caminho_arquivo = output_path / f"shopee_driver_profile_{timestamp}_{download.suggested_filename}"
             await download.save_as(str(caminho_arquivo))
