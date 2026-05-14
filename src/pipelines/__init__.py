@@ -6,7 +6,6 @@ __all__ = [
     "run_monitoramento_pipeline",
     "run_driver_profile_pipeline",
     "run_pnr_pipeline",
-    "run_atribuicao_pipeline",
 ]
 
 
@@ -20,8 +19,5 @@ def __getattr__(name):
         return run_pipeline
     elif name == "run_pnr_pipeline":
         from .shopee_pnr_pipeline import run_pipeline
-        return run_pipeline
-    elif name == "run_atribuicao_pipeline":
-        from .shopee_atribuicao_pipeline import run_pipeline
         return run_pipeline
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
