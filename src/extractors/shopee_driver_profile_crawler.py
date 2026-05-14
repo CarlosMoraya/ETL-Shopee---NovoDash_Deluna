@@ -193,13 +193,25 @@ async def extract_shopee_driver_profile() -> Path:
     if sufixo == ".zip":
         with zipfile.ZipFile(caminho_arquivo, 'r') as zip_ref:
             arquivos = zip_ref.namelist()
-            excel_files = [f for f in arquivos if f.endswith(('.xlsx', '.xls'))]
-            if not excel_files:
-                raise Exception(f"Nenhum arquivo Excel encontrado no ZIP. Arquivos: {arquivos}")
-            arquivo_excel = excel_files[0]
-            logger.info(f"Extraindo {arquivo_excel} do ZIP...")
-            with zip_ref.open(arquivo_excel) as f:
-                df = pd.read_excel(f)
+            logger.info(f"Arquivos no ZIP: {arquivos}")
+
+            csv_files = sorted([f for f in arquivos if f.lower().endswith('.csv')])
+            excel_files = [f for f in arquivos if f.lower().endswith(('.xlsx', '.xls'))]
+
+            if csv_files:
+                logger.info(f"Lendo {len(csv_files)} CSV(s) do ZIP...")
+                dfs = []
+                for csv_file in csv_files:
+                    with zip_ref.open(csv_file) as f:
+                        dfs.append(pd.read_csv(f))
+                df = pd.concat(dfs, ignore_index=True)
+            elif excel_files:
+                arquivo_excel = excel_files[0]
+                logger.info(f"Extraindo {arquivo_excel} do ZIP...")
+                with zip_ref.open(arquivo_excel) as f:
+                    df = pd.read_excel(f)
+            else:
+                raise Exception(f"Nenhum arquivo CSV/Excel no ZIP. Arquivos: {arquivos}")
     elif sufixo == ".csv":
         df = pd.read_csv(caminho_arquivo)
     else:
