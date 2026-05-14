@@ -156,7 +156,7 @@ async def extract_shopee_driver_profile() -> Path:
             # O painel lista TODAS as tarefas históricas — precisamos achar a do driver profile,
             # não a do PNR ou outras. O arquivo gerado tem nome com "br_driver".
             logger.info("Procurando tarefa do driver profile no painel...")
-            palavras_chave = ["br_driver", "driver_profile", "driver-profile"]
+            palavras_chave = ["spx_driver", "br_driver", "driver_profile", "driver-profile"]
             botao_baixar = None
             encontrado = False
 
@@ -198,7 +198,7 @@ async def extract_shopee_driver_profile() -> Path:
             if not encontrado:
                 await page.screenshot(path=str(output_path / "erro_sem_baixar.png"))
                 raise Exception(
-                    "Timeout: tarefa do driver profile (br_driver) não apareceu após 240s adicionais."
+                    "Timeout: tarefa do driver profile (spx_driver) não apareceu após 240s adicionais."
                 )
 
             # 8. DOWNLOAD — clica no botão "Baixar" do driver profile
@@ -211,7 +211,7 @@ async def extract_shopee_driver_profile() -> Path:
             nome_baixado = download.suggested_filename.lower()
             logger.info(f"Nome do arquivo baixado: {download.suggested_filename}")
 
-            if not any(p in nome_baixado for p in ["br_driver", "driver_profile", "driver-profile"]):
+            if not any(p in nome_baixado for p in ["spx_driver", "br_driver", "driver_profile", "driver-profile"]):
                 raise Exception(
                     f"Arquivo baixado não é do driver profile! Nome: {download.suggested_filename}"
                 )
