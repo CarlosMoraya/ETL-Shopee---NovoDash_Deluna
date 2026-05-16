@@ -122,9 +122,10 @@ async def extract_shopee_driver_profile() -> Path:
             # (NÃO usar [role="menuitem"] genérico — casa nav lateral e dispara navegação errada)
             logger.info("Tentativa 1: Localizando item 'Export' do dropdown via JS (escopado)...")
             try:
-                # Aguardar o dropdown realmente abrir
+                # Aguardar o dropdown realmente abrir — Shopee usa .ssc-dropdown-menu (custom),
+                # não Element UI. Também aceitar .el-dropdown-menu como fallback.
                 await page.wait_for_selector(
-                    '.el-dropdown-menu:not([style*="display: none"]), [class*="dropdown-menu"]:not([style*="display: none"])',
+                    '.ssc-dropdown-menu, .el-dropdown-menu, [class*="dropdown-menu"]',
                     timeout=5_000,
                     state="visible",
                 )
@@ -141,18 +142,24 @@ async def extract_shopee_driver_profile() -> Path:
             try:
                 result = await page.evaluate("""
                     () => {
-                        // Buscar APENAS dentro de dropdown-menus VISÍVEIS (não menu lateral)
+                        // Buscar dentro de QUALQUER dropdown-menu visível (Shopee usa .ssc-dropdown-menu)
                         const menus = Array.from(document.querySelectorAll(
-                            '.el-dropdown-menu, [class*="dropdown-menu"]'
+                            '.ssc-dropdown-menu, .el-dropdown-menu, [class*="dropdown-menu"]'
                         )).filter(m => {
                             const s = window.getComputedStyle(m);
                             return s.display !== 'none' && s.visibility !== 'hidden';
                         });
                         for (const menu of menus) {
+                            // Buscar TODOS os clicáveis dentro do menu, não só li
                             const items = Array.from(menu.querySelectorAll(
-                                'li, .el-dropdown-menu__item, [role="menuitem"]'
-                            ));
-                            // Procurar item com texto EXATAMENTE "Export" ou "Exportar"
+                                'li, .ssc-dropdown-menu-item, [class*="dropdown-menu-item"], '
+                                + '.el-dropdown-menu__item, [role="menuitem"], div, span, a'
+                            )).filter(el => {
+                                // Apenas elementos folha com texto curto (evita pegar o menu inteiro)
+                                const txt = (el.textContent || '').trim();
+                                return txt.length > 0 && txt.length < 60 && el.children.length <= 2;
+                            });
+                            // Procurar item com texto EXATO "Export" / "Exportar"
                             // (NÃO "Export History" / "Histórico de exportação")
                             const alvo = items.find(it => {
                                 const txt = (it.textContent || '').trim().toLowerCase();
@@ -162,17 +169,17 @@ async def extract_shopee_driver_profile() -> Path:
                                 alvo.click();
                                 return { success: true, text: alvo.textContent.trim() };
                             }
-                            // Fallback: primeiro item que NÃO seja "history"/"histórico"
+                            // Fallback: primeiro item que NÃO contenha "history"/"histórico"
                             const naoHist = items.find(it => {
                                 const txt = (it.textContent || '').trim().toLowerCase();
-                                return txt && !txt.includes('hist');
+                                return txt && !txt.includes('hist') && (txt.includes('export') || txt.includes('exportar'));
                             });
                             if (naoHist) {
                                 naoHist.click();
                                 return { success: true, text: naoHist.textContent.trim() };
                             }
                         }
-                        return { success: false, reason: 'Nenhum dropdown-menu VISÍVEL encontrado' };
+                        return { success: false, reason: 'Nenhum item Export encontrado em dropdown VISÍVEL' };
                     }
                 """)
                 if result.get('success'):
@@ -235,221 +242,147 @@ async def extract_shopee_driver_profile() -> Path:
             logger.info("Exportação solicitada — aguardando 90s para processamento do servidor...")
             await page.wait_for_timeout(90_000)
 
-            # 6. ABRIR PAINEL "Latest Task" via ícone de tarefas no header
-            # Estratégia: tentar vários seletores de ícone; validar pela aparição do texto
-            # "Latest Task" ou "Última tarefa" no DOM.
-            async def painel_visivel() -> bool:
-                # Playwright não combina selectors text= com vírgula — checa um por um
-                for texto in ("Latest Task", "Última tarefa", "Última Tarefa", "Last Task"):
-                    if await page.get_by_text(texto, exact=False).count() > 0:
-                        return True
-                return False
+            # 6. NAVEGAR PARA A PÁGINA DEDICADA "Export Task Center"
+            # Muito mais determinístico que tentar abrir popover "Latest Task"
+            export_center_url = "https://logistics.myagencyservice.com.br/#/taskCenter/exportTaskCenter"
+            logger.info(f"Navegando para Export Task Center: {export_center_url}")
+            await page.goto(export_center_url, wait_until="domcontentloaded", timeout=60_000)
+            await page.wait_for_timeout(5_000)
+            await page.screenshot(path=str(output_path / "export_task_center.png"))
 
-            logger.info("Abrindo painel 'Latest Task' via ícone de tarefas...")
-            painel_aberto = await painel_visivel()
-            if painel_aberto:
-                logger.info("✅ Painel 'Latest Task' já estava aberto")
-
-            seletores_icone = [
-                'div[data-v-13320df0].icon',  # selector antigo (caso ainda exista)
-                'header div.icon, .header div.icon',
-                '[class*="task-icon"], [class*="taskIcon"]',
-                '.el-icon-document',
-                # Heurística posicional: ícones no canto superior direito
-                # (geralmente são SVGs ou divs antes do dropdown do usuário)
-            ]
-
-            for tentativa_painel in range(6):
-                if painel_aberto:
-                    break
-                for sel in seletores_icone:
-                    try:
-                        icones = page.locator(sel)
-                        n = await icones.count()
-                        for i in range(min(n, 5)):
-                            try:
-                                await icones.nth(i).click(timeout=2_000)
-                                await page.wait_for_timeout(1_500)
-                                if await painel_visivel():
-                                    painel_aberto = True
-                                    logger.info(f"✅ Painel aberto via '{sel}' (idx={i})")
-                                    break
-                            except Exception:
-                                continue
-                        if painel_aberto:
-                            break
-                    except Exception:
-                        continue
-
-                if not painel_aberto:
-                    # Fallback heurístico: clicar em SVGs/divs no header (top-right) por coordenadas
-                    logger.info(f"Tentativa {tentativa_painel + 1}: varrendo ícones do header por coordenadas...")
-                    try:
-                        candidatos = await page.evaluate("""
-                            () => {
-                                const vw = window.innerWidth;
-                                // Busca elementos clicáveis na faixa superior (y<80) e à direita (x>vw-400)
-                                const els = Array.from(document.querySelectorAll(
-                                    'header svg, header div, header i, header button, '
-                                    + '[class*="header"] svg, [class*="header"] div, [class*="header"] i'
-                                ));
-                                const out = [];
-                                for (const el of els) {
-                                    const r = el.getBoundingClientRect();
-                                    if (r.top < 80 && r.right > vw - 400 && r.width > 0 && r.width < 60) {
-                                        out.push({ x: r.left + r.width/2, y: r.top + r.height/2 });
-                                    }
-                                }
-                                // Dedup aproximado
-                                const dedup = [];
-                                for (const c of out) {
-                                    if (!dedup.some(d => Math.abs(d.x - c.x) < 8 && Math.abs(d.y - c.y) < 8)) {
-                                        dedup.push(c);
-                                    }
-                                }
-                                return dedup;
-                            }
-                        """)
-                        for c in candidatos[:10]:
-                            try:
-                                await page.mouse.click(c['x'], c['y'])
-                                await page.wait_for_timeout(1_500)
-                                if await painel_visivel():
-                                    painel_aberto = True
-                                    logger.info(f"✅ Painel aberto via coords ({c['x']:.0f}, {c['y']:.0f})")
-                                    break
-                            except Exception:
-                                continue
-                    except Exception as e:
-                        logger.warning(f"Varredura por coordenadas falhou: {e}")
-
-                if not painel_aberto:
-                    logger.warning(f"Tentativa {tentativa_painel + 1} — painel ainda não aberto, aguardando 15s...")
-                    await page.screenshot(path=str(output_path / f"sem_painel_t{tentativa_painel}.png"))
-                    await page.wait_for_timeout(15_000)
-
-            await page.screenshot(path=str(output_path / "painel_estado_final.png"))
-
-            if not painel_aberto:
-                logger.warning(
-                    "⚠️ Painel 'Latest Task' não confirmado — prosseguindo mesmo assim "
-                    "(tarefa pode estar visível no DOM)."
-                )
-
-            # 7. AGUARDAR NOVA TAREFA — buscar tarefa com timestamp >= hora_antes_export
+            # 7. POLLING — recarregar e procurar tarefa com timestamp >= hora_antes_export
+            # E botão "Baixar"/"Download". Validar pelo nome do arquivo.
             logger.info(
-                f"Aguardando NOVA tarefa de Spx Driver com horário >= "
-                f"{hora_antes_export.strftime('%Y-%m-%d %H:%M:%S')}..."
+                f"Procurando tarefa com horário >= {hora_antes_export.strftime('%Y-%m-%d %H:%M:%S')} "
+                f"e botão Baixar disponível..."
             )
             caminho_arquivo = None
             encontrado = False
 
-            for tentativa in range(10):
+            for tentativa in range(12):
+                await page.wait_for_timeout(2_000)
+
+                # Coletar TODAS as linhas com botão Baixar/Download e tentar extrair timestamp
                 tarefas_info = await page.evaluate("""
                     () => {
                         const tarefas = [];
-                        document.querySelectorAll('tr, .el-scrollbar__view > div, [class*="task"], [class*="item"]').forEach(el => {
-                            const text = el.textContent || '';
-                            if (text.includes('Spx Driver') || text.includes('spx_driver')) {
-                                const timeMatch = text.match(/\\d{4}-\\d{2}-\\d{2}\\s+\\d{2}:\\d{2}:\\d{2}/);
-                                const horario = timeMatch ? timeMatch[0] : 'desconhecido';
-                                const buttons = el.querySelectorAll('button, a');
-                                buttons.forEach(btn => {
-                                    if (btn.textContent.includes('Baixar') || btn.textContent.includes('Download')) {
-                                        tarefas.push({ horario, text: text.substring(0, 200) });
-                                    }
-                                });
+                        // SSC table rows ou Element UI rows
+                        const rows = document.querySelectorAll(
+                            'tr, .ssc-table-row, [class*="table-row"], [class*="task-row"]'
+                        );
+                        rows.forEach((row, idx) => {
+                            const text = row.textContent || '';
+                            const timeMatch = text.match(/\\d{4}-\\d{2}-\\d{2}\\s+\\d{2}:\\d{2}:\\d{2}/);
+                            const horario = timeMatch ? timeMatch[0] : 'desconhecido';
+                            const buttons = row.querySelectorAll('button, a, span[class*="btn"]');
+                            let temBaixar = false;
+                            buttons.forEach(btn => {
+                                const t = (btn.textContent || '').trim();
+                                if (t === 'Baixar' || t === 'Download') {
+                                    temBaixar = true;
+                                }
+                            });
+                            if (temBaixar) {
+                                tarefas.push({ idx, horario, snippet: text.substring(0, 150) });
                             }
                         });
                         return tarefas;
                     }
                 """)
 
-                logger.info(f"Tentativa {tentativa + 1}: {len(tarefas_info)} tarefas Spx Driver com botão Baixar")
+                logger.info(f"Tentativa {tentativa + 1}: {len(tarefas_info)} linhas com botão Baixar")
 
-                tarefa_valida = None
-                if tarefas_info:
-                    tarefa_mais_recente = max(tarefas_info, key=lambda x: x['horario'])
-                    horario_str = tarefa_mais_recente['horario']
-                    logger.info(f"   Mais recente: {horario_str}")
-                    if horario_str != 'desconhecido':
+                # Filtrar tarefas com timestamp >= hora_antes_export
+                # (margem de -60s para tolerar dessincronia de timezone)
+                limite = hora_antes_export.replace(microsecond=0)
+                candidatas = []
+                for t in tarefas_info:
+                    h = t['horario']
+                    if h == 'desconhecido':
+                        continue
+                    try:
+                        dt = datetime.strptime(h, '%Y-%m-%d %H:%M:%S')
+                        if dt >= limite:
+                            candidatas.append((dt, t))
+                    except Exception:
+                        continue
+
+                if candidatas:
+                    candidatas.sort(key=lambda x: x[0], reverse=True)
+                    logger.info(f"   {len(candidatas)} candidatas posteriores ao export — tentando mais recente")
+                    for _, alvo in candidatas:
+                        logger.info(f"   Tentando linha idx={alvo['idx']} horário={alvo['horario']}")
                         try:
-                            hora_tarefa_dt = datetime.strptime(horario_str, '%Y-%m-%d %H:%M:%S')
-                            if hora_tarefa_dt >= hora_antes_export:
-                                tarefa_valida = tarefa_mais_recente
-                                logger.info(
-                                    f"✅ Tarefa {horario_str} é posterior à exportação — baixando!"
-                                )
-                            else:
-                                logger.info(
-                                    f"   Tarefa {horario_str} ainda é anterior à exportação "
-                                    f"({hora_antes_export.strftime('%Y-%m-%d %H:%M:%S')})"
-                                )
-                        except Exception as e:
-                            logger.warning(f"   Erro ao parsear horário: {e}")
-
-                if tarefa_valida:
-                    async with page.expect_download(timeout=120_000) as download_info:
-                        click_result = await page.evaluate("""
-                            () => {
-                                const elementos = document.querySelectorAll('tr, .el-scrollbar__view > div, [class*="task"], [class*="item"]');
-                                let melhor = null;
-                                let melhorHorario = '';
-                                elementos.forEach(el => {
-                                    const text = el.textContent || '';
-                                    if (text.includes('Spx Driver') || text.includes('spx_driver')) {
-                                        const timeMatch = text.match(/\\d{4}-\\d{2}-\\d{2}\\s+\\d{2}:\\d{2}:\\d{2}/);
-                                        const horario = timeMatch ? timeMatch[0] : '';
-                                        if (horario > melhorHorario) {
-                                            melhorHorario = horario;
-                                            melhor = el;
+                            async with page.expect_download(timeout=60_000) as download_info:
+                                click_result = await page.evaluate(
+                                    """
+                                    (idx) => {
+                                        const rows = document.querySelectorAll(
+                                            'tr, .ssc-table-row, [class*="table-row"], [class*="task-row"]'
+                                        );
+                                        const row = rows[idx];
+                                        if (!row) return { success: false, reason: 'linha não existe' };
+                                        const buttons = row.querySelectorAll('button, a, span[class*="btn"]');
+                                        for (const btn of buttons) {
+                                            const t = (btn.textContent || '').trim();
+                                            if (t === 'Baixar' || t === 'Download') {
+                                                btn.click();
+                                                return { success: true };
+                                            }
                                         }
+                                        return { success: false, reason: 'botão não encontrado' };
                                     }
-                                });
-                                if (!melhor) return { success: false };
-                                const buttons = melhor.querySelectorAll('button, a');
-                                for (const btn of buttons) {
-                                    if (btn.textContent.includes('Baixar') || btn.textContent.includes('Download')) {
-                                        btn.click();
-                                        return { success: true, horario: melhorHorario };
-                                    }
-                                }
-                                return { success: false };
-                            }
-                        """)
+                                    """,
+                                    alvo['idx'],
+                                )
+                            if not click_result.get('success'):
+                                logger.warning(f"   Click falhou: {click_result.get('reason')}")
+                                continue
 
-                    if not click_result.get('success'):
-                        logger.warning("⚠️ Encontrou tarefa válida mas não conseguiu clicar — re-tentando...")
-                    else:
-                        logger.info(f"✅ Botão 'Baixar' clicado na tarefa {click_result.get('horario')}!")
-                        download = await download_info.value
-                        nome_baixado = download.suggested_filename.lower()
-                        logger.info(f"Nome do arquivo baixado: {download.suggested_filename}")
+                            download = await download_info.value
+                            nome_baixado = download.suggested_filename.lower()
+                            logger.info(f"   Arquivo baixado: {download.suggested_filename}")
 
-                        if "driver" not in nome_baixado:
-                            raise Exception(
-                                f"Arquivo baixado não é do driver profile (não contém 'driver')! "
-                                f"Nome: {download.suggested_filename}"
+                            if "driver" not in nome_baixado:
+                                logger.warning(
+                                    f"   ⚠️ Arquivo não é driver profile ({nome_baixado}) — pulando"
+                                )
+                                continue
+
+                            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                            caminho_arquivo = (
+                                output_path
+                                / f"shopee_driver_profile_{timestamp}_{download.suggested_filename}"
                             )
+                            await download.save_as(str(caminho_arquivo))
+                            logger.info(f"✅ Arquivo salvo: {caminho_arquivo}")
+                            encontrado = True
+                            break
+                        except Exception as e:
+                            logger.warning(f"   Erro no download desta linha: {e}")
+                            continue
 
-                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                        caminho_arquivo = output_path / f"shopee_driver_profile_{timestamp}_{download.suggested_filename}"
-                        await download.save_as(str(caminho_arquivo))
-                        logger.info(f"✅ Arquivo baixado: {caminho_arquivo}")
-                        encontrado = True
+                    if encontrado:
                         break
 
-                elapsed_extra = (tentativa + 1) * 30
-                logger.info(f"Nenhuma nova tarefa ainda — aguardando 30s ({elapsed_extra}s extra)...")
-                await page.screenshot(path=str(output_path / f"aguardando_nova_tarefa_{elapsed_extra}s.png"))
-                await page.wait_for_timeout(30_000)
+                # Nenhuma candidata válida ainda — recarregar e tentar de novo
+                elapsed = (tentativa + 1) * 20
+                logger.info(f"Aguardando 20s antes de recarregar a página ({elapsed}s decorridos)...")
+                await page.screenshot(path=str(output_path / f"export_center_t{tentativa}.png"))
+                await page.wait_for_timeout(20_000)
+                try:
+                    await page.reload(wait_until="domcontentloaded", timeout=30_000)
+                    await page.wait_for_timeout(3_000)
+                except Exception as e:
+                    logger.warning(f"Reload falhou: {e}")
 
             if not encontrado:
-                await page.screenshot(path=str(output_path / "erro_sem_nova_tarefa.png"))
+                await page.screenshot(path=str(output_path / "erro_export_center.png"))
                 raise Exception(
-                    f"Timeout: nenhuma nova tarefa de export Spx Driver apareceu após 300s "
-                    f"(esperando horário >= {hora_antes_export.strftime('%Y-%m-%d %H:%M:%S')}). "
-                    f"Export pode não ter sido disparado."
+                    f"Timeout: nenhuma tarefa driver profile pronta para download em "
+                    f"/taskCenter/exportTaskCenter após ~4 min (esperando timestamp >= "
+                    f"{hora_antes_export.strftime('%Y-%m-%d %H:%M:%S')}). "
+                    f"Export pode não ter sido disparado ou está demorando demais."
                 )
 
         finally:
