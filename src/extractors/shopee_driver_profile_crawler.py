@@ -239,10 +239,11 @@ async def extract_shopee_driver_profile() -> Path:
             # Estratégia: tentar vários seletores de ícone; validar pela aparição do texto
             # "Latest Task" ou "Última tarefa" no DOM.
             async def painel_visivel() -> bool:
-                count = await page.locator(
-                    'text=Latest Task, text=Última tarefa, text=Última Tarefa'
-                ).count()
-                return count > 0
+                # Playwright não combina selectors text= com vírgula — checa um por um
+                for texto in ("Latest Task", "Última tarefa", "Última Tarefa", "Last Task"):
+                    if await page.get_by_text(texto, exact=False).count() > 0:
+                        return True
+                return False
 
             logger.info("Abrindo painel 'Latest Task' via ícone de tarefas...")
             painel_aberto = await painel_visivel()
