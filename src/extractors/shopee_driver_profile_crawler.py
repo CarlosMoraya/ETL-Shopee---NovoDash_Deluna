@@ -118,33 +118,77 @@ async def extract_shopee_driver_profile() -> Path:
 
             export_sucesso = False
 
-            # Estratégia 1: locator Playwright nativo
-            logger.info("Tentativa 1: Localizando item do dropdown via Playwright...")
-            for sel in [
-                '.el-dropdown-menu__item:first-child',
-                '.el-dropdown-menu li:first-child',
-                'li.el-dropdown-menu__item',
-                '[role="menuitem"]',
-            ]:
-                item = page.locator(sel).first
-                cnt = await item.count()
-                if cnt > 0:
-                    txt = await item.inner_text()
-                    logger.info(f"Item encontrado via '{sel}': '{txt}' — clicando...")
-                    try:
-                        await item.click(timeout=2_000)
-                    except Exception:
-                        await item.click(force=True)
-                    logger.info("✅ Item de dropdown clicado!")
-                    export_sucesso = True
-                    break
+            # Estratégia 1: localizar item EXATO 'Export'/'Exportar' DENTRO de .el-dropdown-menu visível
+            # (NÃO usar [role="menuitem"] genérico — casa nav lateral e dispara navegação errada)
+            logger.info("Tentativa 1: Localizando item 'Export' do dropdown via JS (escopado)...")
+            try:
+                # Aguardar o dropdown realmente abrir
+                await page.wait_for_selector(
+                    '.el-dropdown-menu:not([style*="display: none"]), [class*="dropdown-menu"]:not([style*="display: none"])',
+                    timeout=5_000,
+                    state="visible",
+                )
+            except Exception as e:
+                logger.warning(f"Dropdown não ficou visível em 5s: {e} — tentando re-clicar o botão Export...")
+                try:
+                    await botao_exportar.click()
+                    await page.wait_for_timeout(800)
+                except Exception:
+                    pass
 
-            # Estratégia 2: teclado (ArrowDown + Enter)
+            await page.screenshot(path=str(output_path / "dropdown_aberto.png"))
+
+            try:
+                result = await page.evaluate("""
+                    () => {
+                        // Buscar APENAS dentro de dropdown-menus VISÍVEIS (não menu lateral)
+                        const menus = Array.from(document.querySelectorAll(
+                            '.el-dropdown-menu, [class*="dropdown-menu"]'
+                        )).filter(m => {
+                            const s = window.getComputedStyle(m);
+                            return s.display !== 'none' && s.visibility !== 'hidden';
+                        });
+                        for (const menu of menus) {
+                            const items = Array.from(menu.querySelectorAll(
+                                'li, .el-dropdown-menu__item, [role="menuitem"]'
+                            ));
+                            // Procurar item com texto EXATAMENTE "Export" ou "Exportar"
+                            // (NÃO "Export History" / "Histórico de exportação")
+                            const alvo = items.find(it => {
+                                const txt = (it.textContent || '').trim().toLowerCase();
+                                return txt === 'export' || txt === 'exportar';
+                            });
+                            if (alvo) {
+                                alvo.click();
+                                return { success: true, text: alvo.textContent.trim() };
+                            }
+                            // Fallback: primeiro item que NÃO seja "history"/"histórico"
+                            const naoHist = items.find(it => {
+                                const txt = (it.textContent || '').trim().toLowerCase();
+                                return txt && !txt.includes('hist');
+                            });
+                            if (naoHist) {
+                                naoHist.click();
+                                return { success: true, text: naoHist.textContent.trim() };
+                            }
+                        }
+                        return { success: false, reason: 'Nenhum dropdown-menu VISÍVEL encontrado' };
+                    }
+                """)
+                if result.get('success'):
+                    logger.info(f"✅ Item de dropdown clicado via JS: '{result.get('text')}'")
+                    export_sucesso = True
+                else:
+                    logger.warning(f"JS falhou: {result.get('reason')}")
+            except Exception as e:
+                logger.warning(f"Estratégia 1 (JS escopado) falhou: {e}")
+
+            # Estratégia 2: teclado (ArrowDown + Enter) — só se dropdown estiver aberto
             if not export_sucesso:
                 logger.info("Tentativa 2: Teclado (ArrowDown + Enter)...")
                 try:
                     await botao_exportar.click()
-                    await page.wait_for_timeout(400)
+                    await page.wait_for_timeout(800)
                     await page.keyboard.press("ArrowDown")
                     await page.wait_for_timeout(200)
                     await page.keyboard.press("Enter")
@@ -154,52 +198,19 @@ async def extract_shopee_driver_profile() -> Path:
                 except Exception as e:
                     logger.warning(f"Teclado falhou: {e}")
 
-            # Estratégia 3: JavaScript no menu dropdown
+            # Estratégia 3: coordenadas relativas ao botão (clique abaixo do Export)
             if not export_sucesso:
-                logger.info("Tentativa 3: JavaScript no menu dropdown...")
+                logger.info("Tentativa 3: Click por coordenadas abaixo do botão...")
                 try:
                     await botao_exportar.click()
-                    await page.wait_for_timeout(500)
-                    result = await page.evaluate("""
-                        () => {
-                            const menus = document.querySelectorAll(
-                                '.el-dropdown-menu, [class*="dropdown-menu"]'
-                            );
-                            for (const menu of menus) {
-                                const items = menu.querySelectorAll('li, .el-dropdown-menu__item');
-                                for (const item of items) {
-                                    const txt = item.textContent.trim();
-                                    if (txt && !txt.toLowerCase().includes('hist')) {
-                                        item.click();
-                                        return { success: true, text: txt };
-                                    }
-                                }
-                                if (items.length > 0) {
-                                    items[0].click();
-                                    return { success: true, text: items[0].textContent.trim() };
-                                }
-                            }
-                            return { success: false, reason: 'Nenhum menu dropdown encontrado no DOM' };
-                        }
-                    """)
-                    if result.get('success'):
-                        logger.info(f"✅ JS dropdown: '{result.get('text')}'")
-                        export_sucesso = True
-                    else:
-                        logger.warning(f"JS: {result.get('reason')}")
-                except Exception as e:
-                    logger.warning(f"JavaScript falhou: {e}")
-
-            # Estratégia 4: coordenadas relativas ao botão
-            if not export_sucesso:
-                logger.info("Tentativa 4: Click por coordenadas abaixo do botão...")
-                try:
-                    await botao_exportar.click()
-                    await page.wait_for_timeout(500)
+                    await page.wait_for_timeout(800)
                     coords = await page.evaluate("""
                         () => {
                             const buttons = Array.from(document.querySelectorAll('button'));
-                            const btn = buttons.find(b => b.textContent.trim() === 'Exportar' || b.textContent.trim() === 'Export');
+                            const btn = buttons.find(b => {
+                                const t = (b.textContent || '').trim().toLowerCase();
+                                return t === 'exportar' || t === 'export';
+                            });
                             if (!btn) return null;
                             const rect = btn.getBoundingClientRect();
                             return { x: rect.left + rect.width / 2, y: rect.bottom + 20 };
@@ -211,7 +222,7 @@ async def extract_shopee_driver_profile() -> Path:
                         export_sucesso = True
                         logger.info("✅ Click por coordenadas!")
                     else:
-                        logger.warning("Botão Exportar não encontrado via JS")
+                        logger.warning("Botão Export não encontrado via JS")
                 except Exception as e:
                     logger.warning(f"Coordenadas falharam: {e}")
 
@@ -219,30 +230,110 @@ async def extract_shopee_driver_profile() -> Path:
                 await page.screenshot(path=str(output_path / "erro_exportar.png"))
                 raise Exception("Não foi possível acionar a exportação via dropdown")
 
+            await page.screenshot(path=str(output_path / "pos_export_click.png"))
+
             logger.info("Exportação solicitada — aguardando 90s para processamento do servidor...")
             await page.wait_for_timeout(90_000)
 
-            # 6. ABRIR PAINEL "ÚLTIMA TAREFA" via ícone de tarefas no header
-            logger.info("Abrindo painel 'Última tarefa' via ícone de tarefas...")
-            painel_aberto = False
-            for tentativa_painel in range(4):
-                try:
-                    # Tenta o ícone de tarefas (div com classe icon próximo ao sino)
-                    icone = page.locator('div[data-v-13320df0].icon').first
-                    await icone.wait_for(timeout=5_000)
-                    await icone.click()
-                    await page.wait_for_timeout(3_000)
-                    await page.screenshot(path=str(output_path / f"painel_tentativa_{tentativa_painel}.png"))
-                    painel_aberto = True
-                    logger.info(f"✅ Painel aberto (tentativa {tentativa_painel + 1})")
+            # 6. ABRIR PAINEL "Latest Task" via ícone de tarefas no header
+            # Estratégia: tentar vários seletores de ícone; validar pela aparição do texto
+            # "Latest Task" ou "Última tarefa" no DOM.
+            async def painel_visivel() -> bool:
+                count = await page.locator(
+                    'text=Latest Task, text=Última tarefa, text=Última Tarefa'
+                ).count()
+                return count > 0
+
+            logger.info("Abrindo painel 'Latest Task' via ícone de tarefas...")
+            painel_aberto = await painel_visivel()
+            if painel_aberto:
+                logger.info("✅ Painel 'Latest Task' já estava aberto")
+
+            seletores_icone = [
+                'div[data-v-13320df0].icon',  # selector antigo (caso ainda exista)
+                'header div.icon, .header div.icon',
+                '[class*="task-icon"], [class*="taskIcon"]',
+                '.el-icon-document',
+                # Heurística posicional: ícones no canto superior direito
+                # (geralmente são SVGs ou divs antes do dropdown do usuário)
+            ]
+
+            for tentativa_painel in range(6):
+                if painel_aberto:
                     break
-                except Exception as e:
-                    logger.warning(f"Tentativa {tentativa_painel + 1} — ícone não encontrado: {e}")
-                    await page.wait_for_timeout(30_000)
+                for sel in seletores_icone:
+                    try:
+                        icones = page.locator(sel)
+                        n = await icones.count()
+                        for i in range(min(n, 5)):
+                            try:
+                                await icones.nth(i).click(timeout=2_000)
+                                await page.wait_for_timeout(1_500)
+                                if await painel_visivel():
+                                    painel_aberto = True
+                                    logger.info(f"✅ Painel aberto via '{sel}' (idx={i})")
+                                    break
+                            except Exception:
+                                continue
+                        if painel_aberto:
+                            break
+                    except Exception:
+                        continue
+
+                if not painel_aberto:
+                    # Fallback heurístico: clicar em SVGs/divs no header (top-right) por coordenadas
+                    logger.info(f"Tentativa {tentativa_painel + 1}: varrendo ícones do header por coordenadas...")
+                    try:
+                        candidatos = await page.evaluate("""
+                            () => {
+                                const vw = window.innerWidth;
+                                // Busca elementos clicáveis na faixa superior (y<80) e à direita (x>vw-400)
+                                const els = Array.from(document.querySelectorAll(
+                                    'header svg, header div, header i, header button, '
+                                    + '[class*="header"] svg, [class*="header"] div, [class*="header"] i'
+                                ));
+                                const out = [];
+                                for (const el of els) {
+                                    const r = el.getBoundingClientRect();
+                                    if (r.top < 80 && r.right > vw - 400 && r.width > 0 && r.width < 60) {
+                                        out.push({ x: r.left + r.width/2, y: r.top + r.height/2 });
+                                    }
+                                }
+                                // Dedup aproximado
+                                const dedup = [];
+                                for (const c of out) {
+                                    if (!dedup.some(d => Math.abs(d.x - c.x) < 8 && Math.abs(d.y - c.y) < 8)) {
+                                        dedup.push(c);
+                                    }
+                                }
+                                return dedup;
+                            }
+                        """)
+                        for c in candidatos[:10]:
+                            try:
+                                await page.mouse.click(c['x'], c['y'])
+                                await page.wait_for_timeout(1_500)
+                                if await painel_visivel():
+                                    painel_aberto = True
+                                    logger.info(f"✅ Painel aberto via coords ({c['x']:.0f}, {c['y']:.0f})")
+                                    break
+                            except Exception:
+                                continue
+                    except Exception as e:
+                        logger.warning(f"Varredura por coordenadas falhou: {e}")
+
+                if not painel_aberto:
+                    logger.warning(f"Tentativa {tentativa_painel + 1} — painel ainda não aberto, aguardando 15s...")
+                    await page.screenshot(path=str(output_path / f"sem_painel_t{tentativa_painel}.png"))
+                    await page.wait_for_timeout(15_000)
+
+            await page.screenshot(path=str(output_path / "painel_estado_final.png"))
 
             if not painel_aberto:
-                await page.screenshot(path=str(output_path / "erro_painel.png"))
-                raise Exception("Não foi possível abrir o painel 'Última tarefa'.")
+                logger.warning(
+                    "⚠️ Painel 'Latest Task' não confirmado — prosseguindo mesmo assim "
+                    "(tarefa pode estar visível no DOM)."
+                )
 
             # 7. AGUARDAR NOVA TAREFA — buscar tarefa com timestamp >= hora_antes_export
             logger.info(
