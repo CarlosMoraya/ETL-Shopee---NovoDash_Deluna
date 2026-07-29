@@ -1,0 +1,124 @@
+name: OneDrive -> Google Drive Sync (sob demanda)
+
+on:
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: 'Escopo da sincronização'
+        required: true
+        type: choice
+        options:
+          - tactical
+          - capacity
+      dry_run:
+        description: 'Executar em modo dry-run (sem gravar no destino)'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: onedrive-drive-sync-${{ inputs.scope }}
+  cancel-in-progress: false
+
+env:
+  RCLONE_VERSION: '1.68.2'
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Resolver caminhos de origem e destino
+        id: paths
+        run: |
+          if [ "${{ inputs.scope }}" = "tactical" ]; then
+            echo "source=${{ vars.RCLONE_ONEDRIVE_TACTICAL_SOURCE }}" >> "$GITHUB_OUTPUT"
+            echo "destination=${{ vars.RCLONE_GOOGLE_TACTICAL_DESTINATION }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "source=${{ vars.RCLONE_ONEDRIVE_CAPACITY_SOURCE }}" >> "$GITHUB_OUTPUT"
+            echo "destination=${{ vars.RCLONE_GOOGLE_CAPACITY_DESTINATION }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Validar variáveis de caminho
+        run: |
+          if [ -z "${{ steps.paths.outputs.source }}" ] || [ -z "${{ steps.paths.outputs.destination }}" ]; then
+            echo "::error::Caminhos de origem/destino ausentes para o escopo ${{ inputs.scope }}. Configure as Variables do repositório."
+            exit 1
+          fi
+
+      - name: Instalar rclone (versão fixada, com verificação de checksum)
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -fsSLO "https://downloads.rclone.org/v${RCLONE_VERSION}/rclone-v${RCLONE_VERSION}-linux-amd64.zip"
+          curl -fsSLO "https://downloads.rclone.org/v${RCLONE_VERSION}/SHA256SUMS"
+          grep " rclone-v${RCLONE_VERSION}-linux-amd64.zip\$" SHA256SUMS | sha256sum -c -
+          unzip -q "rclone-v${RCLONE_VERSION}-linux-amd64.zip"
+          sudo install -m 755 "rclone-v${RCLONE_VERSION}-linux-amd64/rclone" /usr/local/bin/rclone
+          rclone version
+
+      - name: Escrever configuração do rclone
+        run: |
+          set -euo pipefail
+          echo "${{ secrets.RCLONE_CONFIG_B64 }}" | base64 -d > "$RUNNER_TEMP/rclone.conf"
+          chmod 600 "$RUNNER_TEMP/rclone.conf"
+
+      - name: Validar remotes configurados (sem imprimir conteúdo)
+        run: |
+          set -euo pipefail
+          rclone --config "$RUNNER_TEMP/rclone.conf" listremotes > "$RUNNER_TEMP/remotes.txt"
+
+          source_remote="$(echo "${{ steps.paths.outputs.source }}" | cut -d: -f1):"
+          destination_remote="$(echo "${{ steps.paths.outputs.destination }}" | cut -d: -f1):"
+
+          if ! grep -qxF "$source_remote" "$RUNNER_TEMP/remotes.txt"; then
+            echo "::error::Remote de origem '$source_remote' não está configurado no rclone.conf"
+            exit 1
+          fi
+          if ! grep -qxF "$destination_remote" "$RUNNER_TEMP/remotes.txt"; then
+            echo "::error::Remote de destino '$destination_remote' não está configurado no rclone.conf"
+            exit 1
+          fi
+          rm -f "$RUNNER_TEMP/remotes.txt"
+
+      - name: Verificar acessibilidade da origem
+        run: |
+          set -euo pipefail
+          if ! rclone --config "$RUNNER_TEMP/rclone.conf" lsf "${{ steps.paths.outputs.source }}" --max-depth 1 > /dev/null; then
+            echo "::error::Não foi possível listar a pasta de origem. Abortando antes de qualquer sincronização para evitar tratar origem inacessível como vazia."
+            exit 1
+          fi
+
+      - name: Sincronizar OneDrive -> Google Drive
+        run: |
+          set -euo pipefail
+          DRY_RUN_FLAG=""
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            DRY_RUN_FLAG="--dry-run"
+          fi
+
+          rclone sync "${{ steps.paths.outputs.source }}" "${{ steps.paths.outputs.destination }}" \
+            --config "$RUNNER_TEMP/rclone.conf" \
+            --create-empty-src-dirs \
+            --fast-list \
+            --transfers 4 \
+            --checkers 8 \
+            --log-level NOTICE \
+            $DRY_RUN_FLAG
+
+      - name: Verificar integridade pós-sincronização
+        if: ${{ inputs.dry_run != 'true' }}
+        run: |
+          set -euo pipefail
+          rclone check "${{ steps.paths.outputs.source }}" "${{ steps.paths.outputs.destination }}" \
+            --config "$RUNNER_TEMP/rclone.conf" \
+            --size-only \
+            --log-level NOTICE
+
+      - name: Remover configuração temporária do rclone
+        if: always()
+        run: rm -f "$RUNNER_TEMP/rclone.conf"
